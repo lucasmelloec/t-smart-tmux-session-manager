@@ -28,11 +28,12 @@ if [ "$1" = "-h" ] || [ "$1" == "--help" ]; then
 	printf "\n"
 	printf "\033[32m  Run interactive mode\n"
 	printf "\033[34m      t\n"
+	printf "\033[34m        ctrl-t list only tmuxinator layouts\n"
 	printf "\033[34m        ctrl-s list only tmux sessions\n"
 	printf "\033[34m        ctrl-x list only zoxide results\n"
 	printf "\033[34m        ctrl-f list results from the find command\n"
 	printf "\n"
-	printf "\033[32m  Go to session (matches tmux session, zoxide result, or directory)\n"
+	printf "\033[32m  Go to session (matches tmuxinator layout, tmux session, zoxide result, or directory)\n"
 	printf "\033[34m      t {name}\n"
 	printf "\n"
 	printf "\033[32m  Open popup (while in tmux)\n"
@@ -43,6 +44,7 @@ if [ "$1" = "-h" ] || [ "$1" == "--help" ]; then
 			T_BIND="T"
 		fi
 		printf "\033[34m      <prefix>+%s\n" "$T_BIND"
+		printf "\033[34m        ctrl-t list only tmuxinator layouts\n"
 		printf "\033[34m        ctrl-s list only tmux sessions\n"
 		printf "\033[34m        ctrl-x list only zoxide results\n"
 		printf "\033[34m        ctrl-f list results from the find command\n"
@@ -75,46 +77,87 @@ get_fzf_prompt() {
 }
 PROMPT=$(get_fzf_prompt)
 
-get_fzf_find_binding() {
-	local fzf_find_binding
-	local fzf_find_binding_default='ctrl-f:change-prompt(find> )+reload(find ~ -maxdepth 3 -type d)'
-	if [ "$TMUX_RUNNING" -eq 0 ]; then
-		fzf_find_binding="$(tmux show -gqv '@t-fzf-find-binding')"
-	fi
-	[ -n "$fzf_find_binding" ] && echo "$fzf_find_binding" || echo "$fzf_find_binding_default"
+attach_session() {
+	case $T_RUNTYPE in # attach to session
+	attached)
+		tmux switch-client -t "$1"
+		;;
+	detached)
+		tmux attach -t "$1"
+		;;
+	serverless)
+		tmux attach -t "$1"
+		;;
+	esac
 }
-FIND_BIND=$(get_fzf_find_binding)
+
+create_session_from_path() {
+	if [ "$1" = "" ]; then # no result
+		exit 0                # exit silently
+	fi
+
+	if [ $HOME_SED_SAFE -eq 0 ]; then
+		RESULT=$(echo "$1" | sed -e "s|^~/|$HOME/|") # get real home path back
+	fi
+
+	zoxide add "$RESULT" &>/dev/null # add to zoxide database
+	FOLDER=$(basename "$RESULT")
+	SESSION_NAME=$(echo "$FOLDER" | tr ' .:' '_')
+
+	if [ "$T_RUNTYPE" != "serverless" ]; then
+		SESSION=$(tmux list-sessions -F '#S' | grep "^$SESSION_NAME$") # find existing session
+	fi
+
+	if [ "$SESSION" = "" ]; then # session is missing
+		SESSION="$SESSION_NAME"
+		tmux new-session -d -s "$SESSION" -c "$RESULT" # create session
+	fi
+
+	attach_session "$SESSION"
+}
+
+SESSIONS_OUTPUT="tmux list-sessions -F '#{session_last_attached} #{session_name}' | sort --numeric-sort --reverse | awk '{print \"session> \" \$2}'"
+LAYOUTS_OUTPUT='tmuxinator list | tail -n +2 | xargs -n 1 echo "layouts> "'
+ZOXIDE_OUTPUT='zoxide query -l | sed -e "$HOME_REPLACER" | xargs -n 1 echo "zoxide> "'
+FIND_OUTPUT='find ~ -maxdepth 3 -type d | xargs -n 1 echo "find> "'
 
 BORDER_LABEL=" t - smart tmux session manager "
-HEADER=" ^s sessions ^x zoxide ^f find"
-SESSION_BIND="ctrl-s:change-prompt(sessions> )+reload(tmux list-sessions -F '#S')"
-ZOXIDE_BIND="ctrl-x:change-prompt(zoxide> )+reload(zoxide query -l | sed -e \"$HOME_REPLACER\")"
+HEADER=" ^t tmuxifier ^s sessions ^x zoxide ^f find"
+SESSION_BIND="ctrl-s:change-prompt(sessions> )+reload(eval '$SESSIONS_OUTPUT')"
+ZOXIDE_BIND="ctrl-x:change-prompt(zoxide> )+reload(eval '$ZOXIDE_OUTPUT')"
+LAYOUT_BIND="ctrl-t:change-prompt(layouts> )+reload(eval '$LAYOUTS_OUTPUT')"
 TAB_BIND="tab:down,btab:up"
-
-get_sessions_by_mru() {
-	tmux list-sessions -F '#{session_last_attached} #{session_name}' | sort --numeric-sort --reverse | awk '{print $2}'
-}
+FIND_BIND="ctrl-f:change-prompt(find> )+reload(eval '$FIND_OUTPUT')"
 
 if [ $# -eq 1 ]; then # argument provided
-	zoxide query "$1" &>/dev/null
-	ZOXIDE_RESULT_EXIT_CODE=$?
-	if [ $ZOXIDE_RESULT_EXIT_CODE -eq 0 ]; then # zoxide result found
-		RESULT=$(zoxide query "$1")
+	tmuxinator list | tail -n +2 | grep -i "$1" &>/dev/null
+	TMUXINATOR_RESULT_EXIT_CODE=$?
+	if [ $TMUXINATOR_RESULT_EXIT_CODE -eq 0 ]; then # tmuxifier session result found
+		RESULT=$(tmuxinator list | tail -n +2 | xargs -n 1 echo | grep -i "$1")
+		tmuxinator start "${RESULT}"
 	else # no zoxide result found
-		ls "$1" &>/dev/null
-		LS_EXIT_CODE=$?
-		if [ $LS_EXIT_CODE -eq 0 ]; then # directory found
-			RESULT=$1
-		else # no directory found
-			echo "No directory found."
-			exit 1
+		zoxide query "$1" &>/dev/null
+		ZOXIDE_RESULT_EXIT_CODE=$?
+		if [ $ZOXIDE_RESULT_EXIT_CODE -eq 0 ]; then # zoxide result found
+			RESULT=$(zoxide query "$1")
+		else # no zoxide result found
+			ls "$1" &>/dev/null
+			LS_EXIT_CODE=$?
+			if [ $LS_EXIT_CODE -eq 0 ]; then # directory found
+				RESULT=$1
+			else # no directory found
+				echo "No directory found."
+				exit 1
+			fi
 		fi
+		create_session_from_path "${RESULT}"
 	fi
 else # argument not provided
 	case $T_RUNTYPE in
 	attached)
 		RESULT=$(
-			(get_sessions_by_mru && (zoxide query -l | sed -e "$HOME_REPLACER")) | fzf-tmux \
+			(eval $LAYOUTS_OUTPUT && eval $SESSIONS_OUTPUT && eval $ZOXIDE_OUTPUT) | fzf-tmux \
+				--bind "$LAYOUT_BIND" \
 				--bind "$FIND_BIND" \
 				--bind "$SESSION_BIND" \
 				--bind "$TAB_BIND" \
@@ -128,7 +171,8 @@ else # argument not provided
 		;;
 	detached)
 		RESULT=$(
-			(get_sessions_by_mru && (zoxide query -l | sed -e "$HOME_REPLACER")) | fzf \
+			(eval $LAYOUTS_OUTPUT && eval $SESSIONS_OUTPUT && eval $ZOXIDE_OUTPUT) | fzf \
+				--bind "$LAYOUT_BIND" \
 				--bind "$FIND_BIND" \
 				--bind "$SESSION_BIND" \
 				--bind "$TAB_BIND" \
@@ -141,45 +185,29 @@ else # argument not provided
 		;;
 	serverless)
 		RESULT=$(
-			(zoxide query -l | sed -e "$HOME_REPLACER") | fzf \
+			(eval $LAYOUTS_OUTPUT && eval $ZOXIDE_OUTPUT) | fzf \
+				--bind "$LAYOUT_BIND" \
+				--bind "$ZOXIDE_BIND" \
 				--bind "$FIND_BIND" \
 				--bind "$TAB_BIND" \
 				--border-label "$BORDER_LABEL" \
-				--header " ^f find" \
+				--header " ^t layouts ^x zoxide ^f find" \
 				--no-sort \
 				--prompt "$PROMPT"
 		)
 		;;
 	esac
+	if [[ "$RESULT" =~ ^layout ]]; then
+		ACTUAL_RESULT="${RESULT:10}"
+		tmuxinator start "$ACTUAL_RESULT"
+	elif [[ "$RESULT" =~ ^zoxide ]]; then
+		ACTUAL_RESULT="${RESULT:9}"
+		create_session_from_path "$ACTUAL_RESULT"
+	elif [[ "$RESULT" =~ ^session ]]; then
+		ACTUAL_RESULT="${RESULT:9}"
+		attach_session "$ACTUAL_RESULT"
+	elif [[ "$RESULT" =~ ^find ]]; then
+		ACTUAL_RESULT="${RESULT:7}"
+		create_session_from_path "$ACTUAL_RESULT"
+	fi
 fi
-
-if [ "$RESULT" = "" ]; then # no result
-	exit 0                     # exit silently
-fi
-
-if [ $HOME_SED_SAFE -eq 0 ]; then
-	RESULT=$(echo "$RESULT" | sed -e "s|^~/|$HOME/|") # get real home path back
-fi
-
-zoxide add "$RESULT" &>/dev/null # add to zoxide database
-FOLDER=$(basename "$RESULT")
-SESSION_NAME=$(echo "$FOLDER" | tr ' .:' '_')
-
-if [ "$T_RUNTYPE" != "serverless" ]; then
-	SESSION=$(tmux list-sessions -F '#S' | grep "^$SESSION_NAME$") # find existing session
-fi
-
-if [ "$SESSION" = "" ]; then # session is missing
-	SESSION="$SESSION_NAME"
-	tmux new-session -d -s "$SESSION" -c "$RESULT" # create session
-fi
-
-case $T_RUNTYPE in # attach to session
-attached)
-	tmux switch-client -t "$SESSION"
-	;;
-detached) ;&
-serverless)
-	tmux attach -t "$SESSION"
-	;;
-esac
